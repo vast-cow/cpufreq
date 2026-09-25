@@ -552,8 +552,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Apply once at startup as well. */
-    ApplyCpuFrequencyLimitDebounced();
+    /* Apply immediately at startup. Debouncing this call would skip the
+     * initial application when the system uptime is less than five seconds.
+     */
+    ApplyCpuFrequencyLimit();
 
     dwResult = RegisterPowerNotification();
     if (dwResult != ERROR_SUCCESS) {
