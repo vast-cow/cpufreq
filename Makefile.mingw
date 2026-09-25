@@ -6,6 +6,7 @@ TARGET  := cpufreq.exe
 OBJECTS := main.o
 
 CPPFLAGS ?=
+CPPFLAGS += -D_WIN32_WINNT=0x0602 -include mingw_compat.h
 CFLAGS   ?= -O2
 CFLAGS   += -std=c11 -Wall -Wextra -Wpedantic
 LDFLAGS  ?=
@@ -18,7 +19,7 @@ all: $(TARGET)
 $(TARGET): $(OBJECTS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
 
-main.o: main.c
+main.o: main.c mingw_compat.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 clean:
