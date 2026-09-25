@@ -2,7 +2,7 @@
 #   mingw32-make -f Makefile.mingw
 
 CC      = gcc
-TARGET  := vast-cow-cpufreq.exe
+TARGET  := cpufreq.exe
 OBJECTS := main.o
 
 CPPFLAGS ?=

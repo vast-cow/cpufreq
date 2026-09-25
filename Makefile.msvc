@@ -3,7 +3,7 @@
 
 CC      = cl
 LD      = link
-TARGET  = vast-cow-cpufreq.exe
+TARGET  = cpufreq.exe
 OBJECTS = main.obj
 
 CFLAGS  = /nologo /O2 /W4 /TC
