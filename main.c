@@ -23,6 +23,8 @@
 #define DEFAULT_CPU_FREQ_AC_MHZ  800u
 #define DEFAULT_CPU_FREQ_DC_MHZ  800u
 #define CPU_FREQ_UNLIMITED_MHZ    0u
+#define CPU_FREQ_MIN_MHZ          100u
+#define CPU_FREQ_MAX_MHZ          64000u
 #define CPU_FREQ_DEBOUNCE_MS      5000ULL
 
 /* Apply settings to the currently active power scheme.
@@ -345,7 +347,8 @@ static void PrintUsage(FILE *pStream, const char *pszProgramName)
         "\n"
         "  If --mhz is combined with --ac-mhz or --dc-mhz, the individual\n"
         "  AC/DC option takes precedence regardless of argument order.\n"
-        "  Defaults: AC=%lu MHz, DC=%lu MHz. A value of 0 means unlimited.\n"
+        "  Valid values are 0 (unlimited) or %lu-%lu MHz.\n"
+        "  Defaults: AC=%lu MHz, DC=%lu MHz.\n"
         "\n"
         "Mode options:\n"
         "  --once              Apply the CPU frequency limit once, then exit.\n"
@@ -353,6 +356,8 @@ static void PrintUsage(FILE *pStream, const char *pszProgramName)
         "  --release-once      Alias for --unthrottle-once.\n"
         "  -h, --help          Show this help.\n",
         pszProgramName,
+        (unsigned long)CPU_FREQ_MIN_MHZ,
+        (unsigned long)CPU_FREQ_MAX_MHZ,
         (unsigned long)DEFAULT_CPU_FREQ_AC_MHZ,
         (unsigned long)DEFAULT_CPU_FREQ_DC_MHZ
     );
@@ -400,6 +405,19 @@ static int ParseFrequencyOption(
             stderr,
             "error: invalid MHz value for %s: %s\n",
             pszOptionName,
+            argv[*pi]
+        );
+        return -1;
+    }
+
+    if (*pdwValue != CPU_FREQ_UNLIMITED_MHZ &&
+        (*pdwValue < CPU_FREQ_MIN_MHZ || *pdwValue > CPU_FREQ_MAX_MHZ)) {
+        fprintf(
+            stderr,
+            "error: MHz value for %s must be 0 (unlimited) or %lu-%lu: %s\n",
+            pszOptionName,
+            (unsigned long)CPU_FREQ_MIN_MHZ,
+            (unsigned long)CPU_FREQ_MAX_MHZ,
             argv[*pi]
         );
         return -1;
