@@ -3,7 +3,9 @@
 `cpufreq` is a small Windows command-line utility that limits the maximum CPU
 frequency used by the active power scheme. It can apply a limit once or remain
 running so that the limit is reapplied after the computer resumes from sleep or
-hibernation and whenever the active power scheme changes.
+hibernation, whenever the active power scheme changes, and whenever Windows'
+effective power mode changes (for example, Best power efficiency, Balanced, or
+Best performance).
 
 By default, the utility limits both AC (plugged-in) and DC (battery) operation
 to **800 MHz**.
@@ -112,10 +114,19 @@ processor power settings for the currently active Windows power scheme, for
 both AC and DC power, and then reactivates that scheme so the changes take
 effect.
 
-In resident mode it listens for suspend/resume and active-power-scheme
-notifications. Resume events are debounced for five seconds to avoid applying
-the same settings twice when Windows emits multiple notifications in quick
-succession.
+In resident mode it listens for suspend/resume, active-power-scheme, and
+effective-power-mode notifications. Effective power modes, sometimes called
+power overlays, can change without changing the underlying active scheme, so
+they are monitored separately. Resume events are debounced for five seconds to
+avoid applying the same settings twice when Windows emits multiple
+notifications in quick succession.
+
+Effective-power-mode notifications use the documented
+`PowerRegisterForEffectivePowerModeNotifications` API. That API is loaded
+dynamically because it is not available on every supported Windows release. On
+older systems where the API is absent, resident mode continues to work with
+suspend/resume and active-power-scheme notifications; only effective power mode
+changes cannot be observed there.
 
 The values are stored in the Windows power scheme; stopping the resident
 process does **not** restore the previous values. Use `--unthrottle-once` to set

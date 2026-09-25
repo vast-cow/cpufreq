@@ -45,8 +45,8 @@ typedef struct _DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
 #define CPU_FREQ_MAX_MHZ          64000u
 #define CPU_FREQ_DEBOUNCE_MS      5000ULL
 
-/* Apply settings to the currently active power scheme.
- * Overlay schemes (OVERLAY_SCHEME_*) are deprecated on current Windows versions.
+/* Apply settings to the currently active power scheme. Effective power modes
+ * (also known as overlays) are monitored separately in resident mode.
  */
 
 /* =========================
@@ -92,12 +92,15 @@ static const GUID g_rgProcessorFrequencySettings[] = {
 static volatile LONG g_lExiting = FALSE;
 static HPOWERNOTIFY g_hSuspendResumeNotify = NULL;
 static HPOWERNOTIFY g_hActiveSchemeNotify = NULL;
+static PVOID g_pEffectivePowerModeRegistration = NULL;
 static HANDLE g_hExitEvent = NULL;
 static DWORD g_dwAcMHz = DEFAULT_CPU_FREQ_AC_MHZ;
 static DWORD g_dwDcMHz = DEFAULT_CPU_FREQ_DC_MHZ;
 
-/* Protect the debounce timestamp in case Windows invokes callbacks concurrently. */
-static SRWLOCK g_srwDebounceLock = SRWLOCK_INIT;
+/* Serialize applications because Windows may invoke the notification callbacks
+ * concurrently. This lock also protects the resume debounce timestamp.
+ */
+static SRWLOCK g_srwApplyLock = SRWLOCK_INIT;
 static ULONGLONG g_ullLastApplyTick = 0;
 
 /* Avoid a notification loop when reactivating the current scheme after an
@@ -106,6 +109,32 @@ static ULONGLONG g_ullLastApplyTick = 0;
 static SRWLOCK g_srwSchemeLock = SRWLOCK_INIT;
 static GUID g_guidLastActiveScheme;
 static BOOL g_fHaveLastActiveScheme = FALSE;
+
+/* PowerRegisterForEffectivePowerModeNotifications was added after the minimum
+ * supported Windows version, so use private ABI-compatible function pointer
+ * declarations and resolve it at run time rather than importing it.
+ */
+typedef VOID (CALLBACK *CPUFREQ_EFFECTIVE_POWER_MODE_CALLBACK)(
+    DWORD dwMode,
+    PVOID pvContext
+);
+typedef HRESULT (WINAPI *CPUFREQ_POWER_REGISTER_EFFECTIVE_MODE)(
+    ULONG ulVersion,
+    CPUFREQ_EFFECTIVE_POWER_MODE_CALLBACK pfnCallback,
+    PVOID pvContext,
+    PVOID *ppvRegistrationHandle
+);
+typedef HRESULT (WINAPI *CPUFREQ_POWER_UNREGISTER_EFFECTIVE_MODE)(
+    PVOID pvRegistrationHandle
+);
+
+#define CPUFREQ_EFFECTIVE_POWER_MODE_V1 1u
+
+static CPUFREQ_POWER_UNREGISTER_EFFECTIVE_MODE
+    g_pfnUnregisterEffectivePowerMode = NULL;
+static SRWLOCK g_srwEffectiveModeLock = SRWLOCK_INIT;
+static DWORD g_dwLastEffectivePowerMode = 0;
+static BOOL g_fHaveLastEffectivePowerMode = FALSE;
 
 /* =========================
  * Helpers
@@ -241,7 +270,9 @@ static DWORD ClearCpuFrequencyLimit(void)
  * Resume handling
  * ========================= */
 
-static void ApplyCpuFrequencyLimitDebounced(void)
+static void ApplyCpuFrequencyLimitSerialized(
+    BOOL fDebounceResume,
+    const char *pszFailureContext)
 {
     ULONGLONG ullNow;
 
@@ -251,21 +282,30 @@ static void ApplyCpuFrequencyLimitDebounced(void)
 
     ullNow = GetTickCount64();
 
-    /* PBT_APMRESUMEAUTOMATIC and PBT_APMRESUMESUSPEND may arrive in quick
-     * succession, so suppress duplicate executions within five seconds.
-     */
-    AcquireSRWLockExclusive(&g_srwDebounceLock);
+    AcquireSRWLockExclusive(&g_srwApplyLock);
 
-    if (ullNow - g_ullLastApplyTick >= CPU_FREQ_DEBOUNCE_MS) {
+    /* The two resume event types may arrive in quick succession. Other event
+     * types are deduplicated by their own state and must not be time-debounced.
+     */
+    if (!fDebounceResume ||
+        ullNow - g_ullLastApplyTick >= CPU_FREQ_DEBOUNCE_MS) {
         if (ApplyCpuFrequencyLimit() == ERROR_SUCCESS) {
-            /* Only successful applications suppress subsequent resume events. */
-            g_ullLastApplyTick = ullNow;
+            if (fDebounceResume) {
+                /* Only successful applications suppress later resume events. */
+                g_ullLastApplyTick = ullNow;
+            }
         } else {
-            fprintf(stderr, "error: failed to reapply CPU frequency limit after resume\n");
+            fprintf(stderr, "error: failed to apply CPU frequency limit %s\n",
+                    pszFailureContext);
         }
     }
 
-    ReleaseSRWLockExclusive(&g_srwDebounceLock);
+    ReleaseSRWLockExclusive(&g_srwApplyLock);
+}
+
+static void ApplyCpuFrequencyLimitDebounced(void)
+{
+    ApplyCpuFrequencyLimitSerialized(TRUE, "after resume");
 }
 
 static BOOL IsNewActiveScheme(const GUID *pSchemeGuid)
@@ -326,11 +366,10 @@ static ULONG CALLBACK PowerNotificationCallback(
                         &g_lExiting,
                         FALSE,
                         FALSE) == FALSE &&
-                    IsNewActiveScheme(&guidNewScheme) &&
-                    ApplyCpuFrequencyLimit() != ERROR_SUCCESS) {
-                    fprintf(
-                        stderr,
-                        "error: failed to apply CPU frequency limit after power scheme change\n"
+                    IsNewActiveScheme(&guidNewScheme)) {
+                    ApplyCpuFrequencyLimitSerialized(
+                        FALSE,
+                        "after power scheme change"
                     );
                 }
             }
@@ -342,6 +381,36 @@ static ULONG CALLBACK PowerNotificationCallback(
     }
 
     return ERROR_SUCCESS;
+}
+
+static VOID CALLBACK EffectivePowerModeCallback(
+    DWORD dwMode,
+    PVOID pvContext)
+{
+    BOOL fChanged = FALSE;
+
+    UNREFERENCED_PARAMETER(pvContext);
+
+    AcquireSRWLockExclusive(&g_srwEffectiveModeLock);
+    if (!g_fHaveLastEffectivePowerMode) {
+        /* Registration immediately reports the current mode. Startup has just
+         * applied the limit, so remember that first report without duplicating
+         * the work.
+         */
+        g_fHaveLastEffectivePowerMode = TRUE;
+        g_dwLastEffectivePowerMode = dwMode;
+    } else if (g_dwLastEffectivePowerMode != dwMode) {
+        g_dwLastEffectivePowerMode = dwMode;
+        fChanged = TRUE;
+    }
+    ReleaseSRWLockExclusive(&g_srwEffectiveModeLock);
+
+    if (fChanged) {
+        ApplyCpuFrequencyLimitSerialized(
+            FALSE,
+            "after effective power mode change"
+        );
+    }
 }
 
 static DWORD RegisterSuspendResumeCallback(void)
@@ -375,9 +444,71 @@ static DWORD RegisterActiveSchemeNotification(void)
     );
 }
 
+static DWORD RegisterEffectivePowerModeNotification(void)
+{
+    HMODULE hPowrProf;
+    CPUFREQ_POWER_REGISTER_EFFECTIVE_MODE pfnRegister;
+    FARPROC pfnRegisterAddress;
+    FARPROC pfnUnregisterAddress;
+    HRESULT hr;
+
+    hPowrProf = GetModuleHandleW(L"powrprof.dll");
+    if (hPowrProf == NULL) {
+        /* PowrProf is already linked for the other power APIs. Treat this like
+         * an unavailable optional API rather than preventing resident mode.
+         */
+        return ERROR_SUCCESS;
+    }
+
+    pfnRegisterAddress = GetProcAddress(
+        hPowrProf,
+        "PowerRegisterForEffectivePowerModeNotifications"
+    );
+    pfnUnregisterAddress = GetProcAddress(
+        hPowrProf,
+        "PowerUnregisterFromEffectivePowerModeNotifications"
+    );
+    if (pfnRegisterAddress == NULL || pfnUnregisterAddress == NULL) {
+        return ERROR_SUCCESS;
+    }
+
+    /* GetProcAddress returns FARPROC. Copy its representation to the precise
+     * signatures without triggering incompatible-function-cast diagnostics.
+     */
+    memcpy(&pfnRegister, &pfnRegisterAddress, sizeof(pfnRegister));
+    memcpy(
+        &g_pfnUnregisterEffectivePowerMode,
+        &pfnUnregisterAddress,
+        sizeof(g_pfnUnregisterEffectivePowerMode)
+    );
+
+    hr = pfnRegister(
+        CPUFREQ_EFFECTIVE_POWER_MODE_V1,
+        EffectivePowerModeCallback,
+        NULL,
+        &g_pEffectivePowerModeRegistration
+    );
+    if (FAILED(hr)) {
+        DWORD dwError = HRESULT_CODE(hr);
+
+        g_pfnUnregisterEffectivePowerMode = NULL;
+        return dwError != ERROR_SUCCESS ? dwError : ERROR_GEN_FAILURE;
+    }
+
+    return ERROR_SUCCESS;
+}
+
 static void UnregisterPowerNotifications(void)
 {
     HPOWERNOTIFY hPowerNotify;
+    PVOID pvRegistration;
+
+    pvRegistration = g_pEffectivePowerModeRegistration;
+    if (pvRegistration != NULL) {
+        g_pEffectivePowerModeRegistration = NULL;
+        (void)g_pfnUnregisterEffectivePowerMode(pvRegistration);
+        g_pfnUnregisterEffectivePowerMode = NULL;
+    }
 
     /* Make cleanup idempotent because main() and atexit() may both call it. */
     hPowerNotify = g_hActiveSchemeNotify;
@@ -442,7 +573,7 @@ static void PrintUsage(FILE *pStream, const char *pszProgramName)
         "\n"
         "Applies the CPU maximum frequency limit. By default, this program\n"
         "stays resident and reapplies the limit after resume from sleep/hibernation\n"
-        "or after the active Windows power scheme changes.\n"
+        "or after the active Windows power scheme/effective power mode changes.\n"
         "\n"
         "Frequency options:\n"
         "  --mhz <MHz>         Set both AC and DC maximum frequency.\n"
@@ -711,6 +842,19 @@ int main(int argc, char **argv)
     dwResult = RegisterActiveSchemeNotification();
     if (dwResult != ERROR_SUCCESS) {
         PrintWin32Error("PowerSettingRegisterNotification", dwResult);
+        UnregisterPowerNotifications();
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        CloseHandle(g_hExitEvent);
+        g_hExitEvent = NULL;
+        return 1;
+    }
+
+    dwResult = RegisterEffectivePowerModeNotification();
+    if (dwResult != ERROR_SUCCESS) {
+        PrintWin32Error(
+            "PowerRegisterForEffectivePowerModeNotifications",
+            dwResult
+        );
         UnregisterPowerNotifications();
         SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
         CloseHandle(g_hExitEvent);
