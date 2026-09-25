@@ -122,66 +122,83 @@ static void PrintWin32Error(const char *pszApiName, DWORD dwError)
  * Power settings API
  * ========================= */
 
-static void ApplyCpuFrequency(DWORD dwAcMHz, DWORD dwDcMHz)
+static DWORD ApplyCpuFrequency(DWORD dwAcMHz, DWORD dwDcMHz)
 {
     GUID *pSchemeGuid = NULL;
     DWORD dwResult;
+    DWORD dwFirstError = ERROR_SUCCESS;
     SIZE_T i;
 
     /* Equivalent to SCHEME_CURRENT: ask Windows for the currently active scheme. */
     dwResult = PowerGetActiveScheme(NULL, &pSchemeGuid);
 
-    /* Preserve the Python version's behavior: if the active scheme cannot be
-     * obtained, simply leave the settings unchanged.
-     */
     if (dwResult != ERROR_SUCCESS) {
-        return;
+        PrintWin32Error("PowerGetActiveScheme", dwResult);
+        return dwResult;
     }
 
     for (i = 0; i < ARRAYSIZE(g_rgProcessorFrequencySettings); ++i) {
         /* Equivalent to:
          * powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR <setting> <ac_mhz>
-         *
-         * Return values are intentionally ignored to match the Python version.
          */
-        (void)PowerWriteACValueIndex(
+        dwResult = PowerWriteACValueIndex(
             NULL,
             pSchemeGuid,
             &g_guidProcessorSettingsSubgroup,
             &g_rgProcessorFrequencySettings[i],
             dwAcMHz
         );
+        if (dwResult != ERROR_SUCCESS) {
+            PrintWin32Error("PowerWriteACValueIndex", dwResult);
+            if (dwFirstError == ERROR_SUCCESS) {
+                dwFirstError = dwResult;
+            }
+        }
 
         /* Equivalent to:
          * powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR <setting> <dc_mhz>
          */
-        (void)PowerWriteDCValueIndex(
+        dwResult = PowerWriteDCValueIndex(
             NULL,
             pSchemeGuid,
             &g_guidProcessorSettingsSubgroup,
             &g_rgProcessorFrequencySettings[i],
             dwDcMHz
         );
+        if (dwResult != ERROR_SUCCESS) {
+            PrintWin32Error("PowerWriteDCValueIndex", dwResult);
+            if (dwFirstError == ERROR_SUCCESS) {
+                dwFirstError = dwResult;
+            }
+        }
     }
 
-    /* Equivalent to: powercfg /setactive SCHEME_CURRENT
-     * Changes to the active scheme take effect after it is re-activated.
-     */
-    (void)PowerSetActiveScheme(NULL, pSchemeGuid);
+    if (dwFirstError == ERROR_SUCCESS) {
+        /* Equivalent to: powercfg /setactive SCHEME_CURRENT
+         * Changes to the active scheme take effect after it is re-activated.
+         */
+        dwResult = PowerSetActiveScheme(NULL, pSchemeGuid);
+        if (dwResult != ERROR_SUCCESS) {
+            PrintWin32Error("PowerSetActiveScheme", dwResult);
+            dwFirstError = dwResult;
+        }
+    }
 
     /* PowerGetActiveScheme allocates the GUID; Windows requires LocalFree. */
     LocalFree(pSchemeGuid);
+
+    return dwFirstError;
 }
 
-static void ApplyCpuFrequencyLimit(void)
+static DWORD ApplyCpuFrequencyLimit(void)
 {
-    ApplyCpuFrequency(g_dwAcMHz, g_dwDcMHz);
+    return ApplyCpuFrequency(g_dwAcMHz, g_dwDcMHz);
 }
 
-static void ClearCpuFrequencyLimit(void)
+static DWORD ClearCpuFrequencyLimit(void)
 {
     /* 0 means unlimited/default for the processor maximum frequency setting. */
-    ApplyCpuFrequency(CPU_FREQ_UNLIMITED_MHZ, CPU_FREQ_UNLIMITED_MHZ);
+    return ApplyCpuFrequency(CPU_FREQ_UNLIMITED_MHZ, CPU_FREQ_UNLIMITED_MHZ);
 }
 
 /* =========================
@@ -191,7 +208,6 @@ static void ClearCpuFrequencyLimit(void)
 static void ApplyCpuFrequencyLimitDebounced(void)
 {
     ULONGLONG ullNow;
-    BOOL fShouldApply = FALSE;
 
     if (InterlockedCompareExchange(&g_lExiting, FALSE, FALSE) != FALSE) {
         return;
@@ -205,15 +221,15 @@ static void ApplyCpuFrequencyLimitDebounced(void)
     AcquireSRWLockExclusive(&g_srwDebounceLock);
 
     if (ullNow - g_ullLastApplyTick >= CPU_FREQ_DEBOUNCE_MS) {
-        g_ullLastApplyTick = ullNow;
-        fShouldApply = TRUE;
+        if (ApplyCpuFrequencyLimit() == ERROR_SUCCESS) {
+            /* Only successful applications suppress subsequent resume events. */
+            g_ullLastApplyTick = ullNow;
+        } else {
+            fprintf(stderr, "error: failed to reapply CPU frequency limit after resume\n");
+        }
     }
 
     ReleaseSRWLockExclusive(&g_srwDebounceLock);
-
-    if (fShouldApply) {
-        ApplyCpuFrequencyLimit();
-    }
 }
 
 static ULONG CALLBACK PowerNotificationCallback(
@@ -526,13 +542,11 @@ int main(int argc, char **argv)
 
     /* One-shot execution. Do not register notifications or stay resident. */
     if (options.RunMode == RUN_MODE_ONCE) {
-        ApplyCpuFrequencyLimit();
-        return 0;
+        return (ApplyCpuFrequencyLimit() == ERROR_SUCCESS) ? 0 : 1;
     }
 
     if (options.RunMode == RUN_MODE_UNTHROTTLE_ONCE) {
-        ClearCpuFrequencyLimit();
-        return 0;
+        return (ClearCpuFrequencyLimit() == ERROR_SUCCESS) ? 0 : 1;
     }
 
     if (atexit(UnregisterPowerNotification) != 0) {
@@ -555,7 +569,13 @@ int main(int argc, char **argv)
     /* Apply immediately at startup. Debouncing this call would skip the
      * initial application when the system uptime is less than five seconds.
      */
-    ApplyCpuFrequencyLimit();
+    if (ApplyCpuFrequencyLimit() != ERROR_SUCCESS) {
+        fprintf(stderr, "error: failed to apply CPU frequency limit at startup\n");
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        CloseHandle(g_hExitEvent);
+        g_hExitEvent = NULL;
+        return 1;
+    }
 
     dwResult = RegisterPowerNotification();
     if (dwResult != ERROR_SUCCESS) {
