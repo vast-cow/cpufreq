@@ -12,6 +12,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef DEVICE_NOTIFY_CALLBACK
+/* MinGW-w64 declares the callback-based power APIs but some releases omit
+ * the accompanying Windows SDK callback flag and parameter declarations.
+ */
+typedef ULONG (CALLBACK *DEVICE_NOTIFY_CALLBACK_ROUTINE)(
+    PVOID Context,
+    ULONG Type,
+    PVOID Setting
+);
+
+typedef struct _DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+    DEVICE_NOTIFY_CALLBACK_ROUTINE Callback;
+    PVOID Context;
+} DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS;
+
+#define DEVICE_NOTIFY_CALLBACK 2
+#endif
+
 #ifdef _MSC_VER
 #pragma comment(lib, "PowrProf.lib")
 #endif
@@ -43,6 +61,14 @@ static const GUID g_guidProcessorSettingsSubgroup = {
     {0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00}
 };
 
+/* GUID_ACTIVE_POWERSCHEME
+ * 31F9F286-5084-42FE-B720-2B0264993763
+ */
+static const GUID g_guidActivePowerScheme = {
+    0x31f9f286, 0x5084, 0x42fe,
+    {0xb7, 0x20, 0x2b, 0x02, 0x64, 0x99, 0x37, 0x63}
+};
+
 /* PROCFREQMAX, PROCFREQMAX1, PROCFREQMAX2 */
 static const GUID g_rgProcessorFrequencySettings[] = {
     {
@@ -64,7 +90,8 @@ static const GUID g_rgProcessorFrequencySettings[] = {
  * ========================= */
 
 static volatile LONG g_lExiting = FALSE;
-static HPOWERNOTIFY g_hPowerNotify = NULL;
+static HPOWERNOTIFY g_hSuspendResumeNotify = NULL;
+static HPOWERNOTIFY g_hActiveSchemeNotify = NULL;
 static HANDLE g_hExitEvent = NULL;
 static DWORD g_dwAcMHz = DEFAULT_CPU_FREQ_AC_MHZ;
 static DWORD g_dwDcMHz = DEFAULT_CPU_FREQ_DC_MHZ;
@@ -72,6 +99,13 @@ static DWORD g_dwDcMHz = DEFAULT_CPU_FREQ_DC_MHZ;
 /* Protect the debounce timestamp in case Windows invokes callbacks concurrently. */
 static SRWLOCK g_srwDebounceLock = SRWLOCK_INIT;
 static ULONGLONG g_ullLastApplyTick = 0;
+
+/* Avoid a notification loop when reactivating the current scheme after an
+ * update. Power-setting callbacks may be invoked concurrently.
+ */
+static SRWLOCK g_srwSchemeLock = SRWLOCK_INIT;
+static GUID g_guidLastActiveScheme;
+static BOOL g_fHaveLastActiveScheme = FALSE;
 
 /* =========================
  * Helpers
@@ -234,13 +268,30 @@ static void ApplyCpuFrequencyLimitDebounced(void)
     ReleaseSRWLockExclusive(&g_srwDebounceLock);
 }
 
+static BOOL IsNewActiveScheme(const GUID *pSchemeGuid)
+{
+    BOOL fChanged = FALSE;
+
+    AcquireSRWLockExclusive(&g_srwSchemeLock);
+
+    if (!g_fHaveLastActiveScheme ||
+        !IsEqualGUID(&g_guidLastActiveScheme, pSchemeGuid)) {
+        g_guidLastActiveScheme = *pSchemeGuid;
+        g_fHaveLastActiveScheme = TRUE;
+        fChanged = TRUE;
+    }
+
+    ReleaseSRWLockExclusive(&g_srwSchemeLock);
+
+    return fChanged;
+}
+
 static ULONG CALLBACK PowerNotificationCallback(
     PVOID pvContext,
     ULONG ulEventType,
     PVOID pvSetting)
 {
     UNREFERENCED_PARAMETER(pvContext);
-    UNREFERENCED_PARAMETER(pvSetting);
 
     switch (ulEventType) {
     case PBT_APMRESUMESUSPEND:
@@ -257,6 +308,35 @@ static ULONG CALLBACK PowerNotificationCallback(
         /* Just before entering sleep/hibernation. No action is needed here. */
         break;
 
+    case PBT_POWERSETTINGCHANGE:
+        if (pvSetting != NULL) {
+            const POWERBROADCAST_SETTING *pSetting =
+                (const POWERBROADCAST_SETTING *)pvSetting;
+
+            if (IsEqualGUID(
+                    &pSetting->PowerSetting,
+                    &g_guidActivePowerScheme) &&
+                pSetting->DataLength == sizeof(GUID)) {
+                GUID guidNewScheme;
+
+                /* Data is a byte array and is not guaranteed to be GUID-aligned. */
+                memcpy(&guidNewScheme, pSetting->Data, sizeof(guidNewScheme));
+
+                if (InterlockedCompareExchange(
+                        &g_lExiting,
+                        FALSE,
+                        FALSE) == FALSE &&
+                    IsNewActiveScheme(&guidNewScheme) &&
+                    ApplyCpuFrequencyLimit() != ERROR_SUCCESS) {
+                    fprintf(
+                        stderr,
+                        "error: failed to apply CPU frequency limit after power scheme change\n"
+                    );
+                }
+            }
+        }
+        break;
+
     default:
         break;
     }
@@ -264,7 +344,7 @@ static ULONG CALLBACK PowerNotificationCallback(
     return ERROR_SUCCESS;
 }
 
-static DWORD RegisterPowerNotification(void)
+static DWORD RegisterSuspendResumeCallback(void)
 {
     DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS subscribeParams;
 
@@ -275,17 +355,40 @@ static DWORD RegisterPowerNotification(void)
     return PowerRegisterSuspendResumeNotification(
         DEVICE_NOTIFY_CALLBACK,
         (HANDLE)&subscribeParams,
-        &g_hPowerNotify
+        &g_hSuspendResumeNotify
     );
 }
 
-static void UnregisterPowerNotification(void)
+static DWORD RegisterActiveSchemeNotification(void)
 {
-    HPOWERNOTIFY hPowerNotify = g_hPowerNotify;
+    DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS subscribeParams;
 
+    ZeroMemory(&subscribeParams, sizeof(subscribeParams));
+    subscribeParams.Callback = PowerNotificationCallback;
+    subscribeParams.Context = NULL;
+
+    return PowerSettingRegisterNotification(
+        &g_guidActivePowerScheme,
+        DEVICE_NOTIFY_CALLBACK,
+        (HANDLE)&subscribeParams,
+        &g_hActiveSchemeNotify
+    );
+}
+
+static void UnregisterPowerNotifications(void)
+{
+    HPOWERNOTIFY hPowerNotify;
+
+    /* Make cleanup idempotent because main() and atexit() may both call it. */
+    hPowerNotify = g_hActiveSchemeNotify;
     if (hPowerNotify != NULL) {
-        /* Make cleanup idempotent because main() and atexit() may both call it. */
-        g_hPowerNotify = NULL;
+        g_hActiveSchemeNotify = NULL;
+        (void)PowerSettingUnregisterNotification(hPowerNotify);
+    }
+
+    hPowerNotify = g_hSuspendResumeNotify;
+    if (hPowerNotify != NULL) {
+        g_hSuspendResumeNotify = NULL;
         (void)PowerUnregisterSuspendResumeNotification(hPowerNotify);
     }
 }
@@ -338,7 +441,8 @@ static void PrintUsage(FILE *pStream, const char *pszProgramName)
         "Usage: %s [options]\n"
         "\n"
         "Applies the CPU maximum frequency limit. By default, this program\n"
-        "stays resident and reapplies the limit after resume from sleep/hibernation.\n"
+        "stays resident and reapplies the limit after resume from sleep/hibernation\n"
+        "or after the active Windows power scheme changes.\n"
         "\n"
         "Frequency options:\n"
         "  --mhz <MHz>         Set both AC and DC maximum frequency.\n"
@@ -567,7 +671,7 @@ int main(int argc, char **argv)
         return (ClearCpuFrequencyLimit() == ERROR_SUCCESS) ? 0 : 1;
     }
 
-    if (atexit(UnregisterPowerNotification) != 0) {
+    if (atexit(UnregisterPowerNotifications) != 0) {
         fprintf(stderr, "warning: atexit registration failed\n");
     }
 
@@ -595,9 +699,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    dwResult = RegisterPowerNotification();
+    dwResult = RegisterSuspendResumeCallback();
     if (dwResult != ERROR_SUCCESS) {
         PrintWin32Error("PowerRegisterSuspendResumeNotification", dwResult);
+        SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
+        CloseHandle(g_hExitEvent);
+        g_hExitEvent = NULL;
+        return 1;
+    }
+
+    dwResult = RegisterActiveSchemeNotification();
+    if (dwResult != ERROR_SUCCESS) {
+        PrintWin32Error("PowerSettingRegisterNotification", dwResult);
+        UnregisterPowerNotifications();
         SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
         CloseHandle(g_hExitEvent);
         g_hExitEvent = NULL;
@@ -610,7 +724,7 @@ int main(int argc, char **argv)
         InterlockedExchange(&g_lExiting, TRUE);
     }
 
-    UnregisterPowerNotification();
+    UnregisterPowerNotifications();
 
     SetConsoleCtrlHandler(ConsoleCtrlHandler, FALSE);
     CloseHandle(g_hExitEvent);
