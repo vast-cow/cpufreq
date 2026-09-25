@@ -1,0 +1,23 @@
+# Build with the Microsoft Visual C/C++ toolchain from a Developer Command Prompt:
+#   nmake /f Makefile.msvc
+
+CC      = cl
+LD      = link
+TARGET  = vast-cow-cpufreq.exe
+OBJECTS = main.obj
+
+CFLAGS  = /nologo /O2 /W4 /TC
+LDFLAGS = /nologo
+LDLIBS  = PowrProf.lib
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(LD) $(LDFLAGS) /OUT:$@ $(OBJECTS) $(LDLIBS)
+
+main.obj: main.c
+	$(CC) $(CFLAGS) /c main.c /Fo$@
+
+clean:
+	-if exist "$(TARGET)" del /Q "$(TARGET)"
+	-if exist "$(OBJECTS)" del /Q "$(OBJECTS)"

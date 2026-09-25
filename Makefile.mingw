@@ -1,0 +1,25 @@
+# Build from an MSYS2 UCRT64 shell:
+#   mingw32-make -f Makefile.mingw
+
+CC      = gcc
+TARGET  := vast-cow-cpufreq.exe
+OBJECTS := main.o
+
+CPPFLAGS ?=
+CFLAGS   ?= -O2
+CFLAGS   += -std=c11 -Wall -Wextra -Wpedantic
+LDFLAGS  ?=
+LDLIBS   := -lpowrprof
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
+
+main.o: main.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
+
+clean:
+	$(RM) $(TARGET) $(OBJECTS)
